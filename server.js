@@ -7,7 +7,6 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const nodemailer = require('nodemailer');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
@@ -26,11 +25,17 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*')
 const TO_EMAIL = process.env.TO_EMAIL || 'info@voicentraresearch.com';
 const CC_EMAIL = process.env.CC_EMAIL || 'voicentraresearch@gmail.com';
 
-// The address that appears as the sender in the actual email.
-// With some providers (like Brevo) the SMTP login isn't a real inbox,
-// so this is kept separate. Falls back to SMTP_USER if not set,
-// which keeps this working the same as before for Gmail setups.
-const FROM_EMAIL = process.env.FROM_EMAIL || process.env.SMTP_USER;
+// The address (and name) that appears as the sender. Must be a
+// "Verified" sender in your Brevo account (Senders, Domains &
+// Dedicated IPs -> Senders).
+const FROM_EMAIL = process.env.FROM_EMAIL;
+const FROM_NAME = process.env.FROM_NAME || 'Voicentra Website';
+
+// Brevo API key (Brevo dashboard -> SMTP & API -> API Keys & MCP tab).
+// NOTE: this is a different key from the SMTP key — Render's free plan
+// blocks the SMTP ports (25/465/587) entirely, so we send over Brevo's
+// HTTPS API instead, which isn't affected by that restriction.
+const BREVO_API_KEY = process.env.BREVO_API_KEY;
 
 // ---------- Middleware ----------
 app.use(express.json());
@@ -58,29 +63,41 @@ const formLimiter = rateLimit({
   message: { ok: false, error: 'Too many submissions. Please try again later.' },
 });
 
-// ---------- Mail transport ----------
-// Works with Gmail (App Password), or any SMTP provider
-// (Zoho, Brevo, Resend, SendGrid, your hosting's SMTP, etc.)
-// Just change the values in .env — this code doesn't need to change.
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,           // e.g. smtp.gmail.com
-  port: Number(process.env.SMTP_PORT),   // 465 (SSL) or 587 (TLS)
-  secure: Number(process.env.SMTP_PORT) === 465, // true for 465, false for 587
-  auth: {
-    user: process.env.SMTP_USER,         // the mailbox that SENDS the email
-    pass: process.env.SMTP_PASS,         // app password / SMTP password
-  },
-});
+// ---------- Mail sending (Brevo HTTP API) ----------
+if (!BREVO_API_KEY) {
+  console.error('❌ BREVO_API_KEY is missing from your environment variables.');
+} else {
+  console.log('✅ Brevo API key found — ready to send emails.');
+}
 
-// Verify SMTP connection on startup so misconfiguration fails loudly.
-transporter.verify((err) => {
-  if (err) {
-    console.error('❌ SMTP connection failed:', err.message);
-    console.error('   Check SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS in .env');
-  } else {
-    console.log('✅ SMTP connection is ready to send emails.');
+async function sendEmail({ subject, html, replyTo }) {
+  const payload = {
+    sender: { name: FROM_NAME, email: FROM_EMAIL },
+    to: [{ email: TO_EMAIL }],
+    cc: CC_EMAIL ? [{ email: CC_EMAIL }] : undefined,
+    subject,
+    htmlContent: html,
+  };
+
+  if (replyTo) {
+    payload.replyTo = { email: replyTo };
   }
-});
+
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'api-key': BREVO_API_KEY,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Brevo API error (${res.status}): ${errText}`);
+  }
+}
 
 // ---------- Helpers ----------
 function escapeHtml(str = '') {
@@ -141,13 +158,10 @@ app.post('/api/panel-book', formLimiter, async (req, res) => {
       ['Referred Via', referral],
     ]);
 
-    await transporter.sendMail({
-      from: `"Voicentra Website" <${FROM_EMAIL}>`,
-      to: TO_EMAIL,
-      cc: CC_EMAIL,
-      replyTo: email, // lets you hit "Reply" and answer the requester directly
+    await sendEmail({
       subject: `Panel Book Request — ${name}`,
       html,
+      replyTo: email, // lets you hit "Reply" and answer the requester directly
     });
 
     return res.json({ ok: true, message: 'Request sent successfully.' });
@@ -176,13 +190,10 @@ app.post('/api/join-us', formLimiter, async (req, res) => {
       ['Message', message],
     ]);
 
-    await transporter.sendMail({
-      from: `"Voicentra Website" <${FROM_EMAIL}>`,
-      to: TO_EMAIL,
-      cc: CC_EMAIL,
-      replyTo: email,
+    await sendEmail({
       subject: `Join Us Application — ${name}`,
       html,
+      replyTo: email,
     });
 
     return res.json({ ok: true, message: 'Application sent successfully.' });
@@ -208,10 +219,7 @@ app.post('/api/career-chat', formLimiter, async (req, res) => {
       ['Contact Details', 'Not collected — this button does not currently ask for a name or email. Reply to this email if you would like that added.'],
     ]);
 
-    await transporter.sendMail({
-      from: `"Voicentra Website" <${FROM_EMAIL}>`,
-      to: TO_EMAIL,
-      cc: CC_EMAIL,
+    await sendEmail({
       subject: 'New Career Chat Request — Voicentra Website',
       html,
     });
